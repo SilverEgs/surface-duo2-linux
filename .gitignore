@@ -20,3 +20,6 @@ tools/dump-phase0.sh
 *.dtb
 *.dts
 *.bintools/hosttools/
+*.cpio
+boot.img
+vendor_boot.img
