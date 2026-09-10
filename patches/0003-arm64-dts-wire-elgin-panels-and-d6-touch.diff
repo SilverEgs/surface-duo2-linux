@@ -1,0 +1,142 @@
+diff --git a/arch/arm64/boot/dts/qcom/sm8350-microsoft-surface-duo2.dts b/arch/arm64/boot/dts/qcom/sm8350-microsoft-surface-duo2.dts
+index 442405ba5..93d4cac57 100644
+--- a/arch/arm64/boot/dts/qcom/sm8350-microsoft-surface-duo2.dts
++++ b/arch/arm64/boot/dts/qcom/sm8350-microsoft-surface-duo2.dts
+@@ -293,6 +293,100 @@ &ipa {
+ 	status = "okay";
+ };
+ 
++/*
++ * Dual "elgin" OLED panels, one per DSI controller (DDIC rev "c3" on DSI0,
++ * rev "r2" on DSI1).
++ *
++ * Regulator mapping (panel "vddio" = 1.8V I/O, "vdd" = 3.0V source, per the
++ * vendor lahaina "dsi_panel_pwr_supply" node which lists exactly those two
++ * rails).  The Duo 2 board-level DTS is not part of the GPL devicetree
++ * release, so this is mapped by rail voltage onto the pm8350c RPMH LDOs
++ * already defined in this file's &apps_rsc regulators-1:
++ *   - vddio (1.8V) -> vreg_l1c_1p8 (pm8350c LDO1)
++ *   - vdd   (3.0V) -> vreg_l7c_3p0 (pm8350c LDO7, fixed 3.008V; the only 3.0V
++ *     LDO in this board file not already claimed by USB/UFS/SDHC)
++ * Both LDOs are already defined and get enabled on demand by the panel
++ * driver, so no new regulator nodes are needed.  If l7c proves wrong on
++ * hardware, vreg_l3c_3p0 (also 3.008V) is the alternative source-rail.
++ *
++ * Reset polarity: panel-elgin.c takes "reset" with GPIOD_OUT_HIGH and its
++ * prepare() pulses logical 1 -> 10ms -> 0 -> 10ms.  With GPIO_ACTIVE_LOW that
++ * reproduces the vendor qcom,mdss-dsi-reset-sequence of <0 10>, <1 10>
++ * (assert low, then release high).  Reset is tlmm 24 (from the vendor elgin
++ * panel include).
++ */
++&mdss {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&vreg_l6b_1p2>;
++	status = "okay";
++
++	panel@0 {
++		compatible = "microsoft,elgin-c3", "microsoft,elgin";
++		reg = <0>;
++
++		vdd-supply = <&vreg_l7c_3p0>;
++		vddio-supply = <&vreg_l1c_1p8>;
++
++		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
++
++		port {
++			panel0_in: endpoint {
++				remote-endpoint = <&mdss_dsi0_out>;
++			};
++		};
++	};
++};
++
++&mdss_dsi0_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&panel0_in>;
++};
++
++&mdss_dsi0_phy {
++	vdds-supply = <&vreg_l5b_0p88>;
++	status = "okay";
++};
++
++&mdss_dsi1 {
++	vdda-supply = <&vreg_l6b_1p2>;
++	status = "okay";
++
++	panel@0 {
++		compatible = "microsoft,elgin-r2", "microsoft,elgin";
++		reg = <0>;
++
++		vdd-supply = <&vreg_l7c_3p0>;
++		vddio-supply = <&vreg_l1c_1p8>;
++
++		/*
++		 * FIXME: unverified.  The vendor include only documents one panel
++		 * reset (tlmm 24).  If the two panels are reset independently,
++		 * DSI1's reset is a *different* pin (cf. a second DISPx_RESET_N);
++		 * using tlmm 24 here assumes a shared reset line.
++		 */
++		reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
++
++		port {
++			panel1_in: endpoint {
++				remote-endpoint = <&mdss_dsi1_out>;
++			};
++		};
++	};
++};
++
++&mdss_dsi1_out {
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&panel1_in>;
++};
++
++&mdss_dsi1_phy {
++	vdds-supply = <&vreg_l5b_0p88>;
++	status = "okay";
++};
++
+ &mpss {
+ 	status = "okay";
+ 	firmware-name = "qcom/sm8350/microsoft/modem.mbn";
+@@ -311,6 +405,36 @@ &slpi {
+ 	firmware-name = "qcom/sm8350/microsoft/slpi.mbn";
+ };
+ 
++/*
++ * "d6" touch controller over HIDSPI.  The vendor places d6_hid@0 on
++ * "qupv3_se4", which is mainline spi4 (spi@990000, GCC_QUPV3_WRAP0_S4_CLK).
++ * d6_irq is tlmm 84.
++ *
++ * The IRQ trigger (edge falling) is taken from the hid-over-spi binding
++ * example, which documents exactly this Duo 2 "d6" controller; it has not
++ * been re-confirmed against the vendor board DTS (absent from the GPL
++ * release).  The binding's example also lists an optional
++ * "reset-gpios = <&tlmm 85 GPIO_ACTIVE_LOW>" for the d6, which is omitted
++ * here per the task scope -- add it if probing shows the controller needs a
++ * host-side reset pulse.
++ *
++ * NOTE: mainline spi4 has no pinctrl-0 in sm8350.dtsi, and the Duo 2 pin
++ * mapping for these SPI pads is not in the GPL release, so the four GENI SPI
++ * pins are not muxed by this node.
++ */
++&spi4 {
++	status = "okay";
++
++	touchscreen@0 {
++		compatible = "hid-over-spi";
++		reg = <0>;
++		interrupt-parent = <&tlmm>;
++		interrupts = <84 IRQ_TYPE_EDGE_FALLING>;
++		spi-max-frequency = <32000000>;
++		hid-descr-addr = <1>;
++	};
++};
++
+ &tlmm {
+ 	gpio-reserved-ranges = <4 4>, <12 4>, <56 4>, <76 4>;
+ };
