@@ -1,75 +1,95 @@
-# Surface Duo 2 display — elgin panel engineering spec
+# Surface Duo 2 display — elgin panel spec (AUTHORITATIVE, from vendor source)
 
-Extracted from vendor DTBO (dtbo_b.img.dtb9.dts, model "Surface Duo2 MP", active
-dtbo_idx=9) and Android dumpsys.
+Source: `surface-duo-oss-sm8350.11.display-devicetree` repo, branch
+`surfaceduo2/11/2023.501.24`, files `surface_elgin_dsi0_c3_cmd_mp.dtsi`
+(DSI0, DDIC "c3") and `surface_elgin_dsi1_r2_cmd_mp.dtsi` (DSI1, DDIC "r2"),
+plus `surface_elgin_dsi_sync_cmd_mp.dtsi` (spanned/sync).
+MP = mass production = what the device ships. This supersedes the earlier
+reverse-engineered DTBO notes (which carried a 1440x2880 sw43404 *reference*
+template — NOT the elgin).
+
+## Resolution (RESOLVED)
+
+- **1344 x 1892** per panel, both DSI controllers. (Android reports 2688x1892
+  spanned = two 1344x1892 panels — matches.)
+- physical dimension 85 x 120 mm.
 
 ## Panel identity
 
-- DDIC: Samsung **SW43404** (AMOLED DSI DDIC). Panel module manufactured by BOE.
-- Mainline template: `drivers/gpu/drm/panel/panel-boe-bf060y8m-aj0.c`
-  (.name = "panel-sw43404-boe-fhd-amoled") — same DDIC, adapt for this panel.
-- Panel type: `dsi_cmd_mode`, physical type `oled`.
-- DSI: 4 lanes, dsi-ctrl-num=0, dsi-phy-num=0 (DSI0). Second panel on DSI1.
+- name: "dsi elgin dsc dsi0 c3 cmd mp" / "dsi elgin dsc dsi1 r2 cmd mp"
+- type: `dsi_cmd_mode`, physical `oled`, bpp 24, color-order "rgb_swap_rgb"
+- DSI0 panel: DDIC rev "c3"; DSI1 panel: DDIC rev "r2" (identical geometry,
+  near-identical init).
+- 4 lanes, lane-map 0123, traffic-mode non_burst_sync_event.
+- DDIC vendor: not yet pinned. (The "sw43404" label in the older DTBO is a
+  reference panel; the elgin init uses Samsung-style UCS/MCS key sequences.
+  Confirm DDIC against the main kernel's panel list before finalizing the
+  mainline compatible string.)
 
-## AMBIGUITY — resolution must be resolved against vendor source
+## Timing (two modes)
 
-DTBO lists THREE panel configs (all sw43404 BOE):
-- cmd mode  1440x2880 (0x5a0 x 0xb40)  <- has full on-command
-- video mode 1440x2880
-- fhd+ 1080x2160 (0x438 x 0x870)
+| | 60 Hz (timing@0) | 90 Hz (timing@1) |
+|---|---|---|
+| framerate | 60 | 90 |
+| h-front/back/pulse | 32 / 32 / 32 | 32 / 32 / 32 |
+| v-back/front/pulse | 32 / 32 / 10 | 32 / 32 / 10 |
+| panel clockrate | 700 MHz | 760 MHz |
+| t-clk post / pre | 0x0B / 0x16 | 0x0B / 0x17 |
 
-But the live Android device reports 2688x1892 SPANNED (two panels) => 1344x1892
-per panel @ 60/90 Hz, 401 dpi. NONE of the DTBO entries is 1344x1892.
+## DSC (per panel)
 
-Resolution + exact init sequence for the real "elgin" Duo 2 panel MUST be taken
-from the vendor GPL kernel (microsoft/surface-duo-oss lahaina tree), NOT
-assumed from the shared sw43404 template. The DTBO bytes below are the best
-available reference but may be the reference-panel variant, not the Duo 2's.
+- version 0x11 (DSC 1.1), scr 0x0, encoders 1
+- slice-per-pkt 2, slice-width 672, slice-height 946, bpc 8, bpp 8, block-prediction
+- PPS (128-byte picture parameter set) embedded in the on-command `0A` write.
 
-## Timing (cmd-mode entry, timing@0)
+## Reset / power
 
-- panel-width 0x5a0=1440, panel-height 0xb40=2880, framerate 0x3c=60Hz
-- h-front-porch 60, h-back-porch 30, h-pulse-width 12, h-sync-skew 0
-- v-front-porch 8, v-back-porch 8, v-pulse-width 1
-- bpp 0x18=24, h-sync-pulse 0 (event mode)
-- trafofic mode: non_burst_sync_event; dma-trigger trigger_sw; mdp-trigger none
+- reset-sequence <0 10> <1 10> (assert/deassert 10 ms)
+- surface-platform-freq-force-gpio = tlmm 166, surface-platform-freq-sel-gpio = tlmm 167
 
-## DSC (VESA DSC, command mode)
+## Init sequence (from qcom,mdss-dsi-on-command — fully commented upstream)
 
-- compression-mode dsc, slice-width 0x2d0=720, slice-height 0xb4=180
-- slice-per-pkt 1 (cmd) / 2 (video), bpc 8, bpp 8, block-prediction enabled
-- roi-align 720x180; partial-update single_roi
+Order (each `NN LL 00 00 XX YY 00 …` is a DCS/DSI cmd; LL=delay):
+  1. 3B write 7F 5A 5A          UCS access
+  2. 3B write F0 / F1 / F2 5A 5A  MCS access LV1/LV2/LV3
+  3. 3B write E7 00              flash access
+  4. 15 write 02 01              enable DSC
+  5. 15 write 59 00              command DSC mode
+  6. 39 write 2A 00 00 05 3F     column addr 0..1343
+  7. 39 write 2B 00 00 07 63     page addr 0..1891
+  8. 39 write 51 05 87           default DBV 350 nits
+  9. 15 write 53 20              brightness control ON
+  10. 15 write 55 04             PLC rate1
+  11. 39 write 57 20 01 00 F8 FF F0 00   mLPIS
+  12. 39 write 58 00 00 00 F8 FF FC      AoD mLPIS (all OFF)
+  13. 15 write 76 00|01          DHFR mode (60/90 Hz)
+  14. 0A write <128-byte PPS>    DSC picture parameter set
+  15. 39 write 74 05 00 34       QSYNC_EN=1 EXT_TRIG=1 QSYNC_TO=208
+  16. 15 write 35 00             TE on
+  17. 39 write 44 00 00          TE_LINE=0
+  18. 05 write 11 (wait 130 ms)  sleep out
+  19. 39 write E5 00 20          force DCS TE
+  20. VFP trimming: B0 08 + E1 00 04 4C ; B0 10 + E1 00 00 18
+  21. 39 write B0 70, then EC 01
 
-## Power / reset
+off-command: 28 (display off, wait 20 ms) then 10 (sleep in, wait 110 ms).
+post-panel-on: 29 (display on).
 
-- platform-reset-gpio = tlmm 24 (0x18)
-- reset-sequence: assert 10ms, deassert 10ms, assert 10ms
-- panel-supply-entries (regulator list; cross-ref dtb9 display_gpio_regulator,
-  display_panel_avdd @ fragment@47)
+## Surface-specific extras (Microsoft props)
 
-## Backlight (DCS)
+- surface-ext-trig-enable = 1
+- surface-dsi-elvss-levels = 10
+- surface-dsi-aod-on/off-commands (AoD 8-color mode + DBV writes)
+- surface-dsi-switch-rr-60/90-commands (DHFR 76 write)
+- Backlight: DCS-based (53 20 + 51 DBV write).
 
-- bl-pmic-control-type bl_ctrl_dcs; bl-min-level 1; bl-max-level 0x3ff=1023
-- brightness-max-level 0xff=255
+## Driver-authoring notes
 
-## HDR
-
-- enabled; peak-brightness 0x401640; blackness 0xc9e; color primaries captured
-  in the dtb9 source.
-
-## Init / state commands (raw qcom DSI encodings — transcribe to mipi_dsi)
-
-- on-command  (line 85 of dtb9) — full SW43404 init (reg writes, gamma, DSC on)
-- off-command (line 86) — 0x28 display off, 0x10 sleep in
-- lp1-command  0x39 (enter idle/DSI lp) — low-power mode
-- nolp-command 0x38 (exit idle)
-- status-check: reg_read 0x0a, expect value 0x9c; esd-check enabled
-
-## Notes for driver authoring
-
-- mainline `panel-boe-bf060y8m-aj0.c` is the structural template (SW43404:
-  prepare/unprepare, enable/disable, DSC, DCS backlight). Swap in this panel's
-  resolution/timing/init from the vendor source.
-- Two instances (DSI0 + DSI1) — instantiate the same panel driver on both
-  controllers; posture/hinge logic decides single vs dual vs spanned output.
-- Confirm resolution + init against vendor source before writing the driver.
+- Mainline template: `drivers/gpu/drm/panel/panel-boe-bf060y8m-aj0.c` (SW43404
+  DDIC) for DSI command-mode + DSC + DCS backlight structure. Adapt: resolution
+  1344x1892, the above init/PPS, DSC 1.1 (slice 672x946, per-pkt 2), dual
+  timing 60/90 Hz.
+- Two instances (DSI0 + DSI1): same driver, two DT nodes (c3 vs r2).
+- The Surface extras (elvss/AoD/rr-switch/ext-trig) map to a custom
+  brightness/refresh + AoD interface — source in the main kernel's surface
+  panel glue (to be pulled from `surface-duo-oss-kernel.msm-5..4`).
