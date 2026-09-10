@@ -1,0 +1,1005 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * HID over SPI transport driver (MIPI HIDSPI protocol)
+ *
+ * A generic HID transport driver for HID-over-SPI devices that
+ * bind to a Linux struct spi_device.  It implements the MIPI
+ * HID-over-SPI protocol as encoded by the kernel's
+ * include/linux/hid-over-spi.h framework.
+ *
+ * The driver's architecture follows i2c-hid-core.c for HID
+ * subsystem integration (hid_allocate_device / hid_add_device /
+ * hid_input_report) and intel-quickspi for the HIDSPI protocol
+ * mechanics (descriptor fetch, input‑header parsing, power states,
+ * command/response dispatch).
+ *
+ * It is intentionally a *generic* SPI‑device driver — it does NOT
+ * speak the proprietary protocol of any specific touch controller.
+ * The "d6" touch controller in the Microsoft Surface Duo 2 is one
+ * known consumer of this driver.
+ *
+ * Copyright (c) 2026 Linux Surface Duo 2 porting effort
+ */
+
+#include <linux/bitfield.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/hid.h>
+#include <linux/hid-over-spi.h>
+#include <linux/interrupt.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/pm.h>
+#include <linux/pm_runtime.h>
+#include <linux/slab.h>
+#include <linux/spi/spi.h>
+#include <linux/wait.h>
+
+/* ------------------------------------------------------------------ */
+/*  Driver-private definitions                                         */
+/* ------------------------------------------------------------------ */
+
+/* Maximum time to wait for a command response, in jiffies (5 s) */
+#define HIDSPI_CMD_TIMEOUT	msecs_to_jiffies(5000)
+
+/* Device flags */
+#define HIDSPI_FLAG_STARTED		BIT(0)
+#define HIDSPI_FLAG_RESET_PENDING	BIT(1)
+
+/* Maximum input read size (conservative: 512 bytes) */
+#define HIDSPI_MAX_INPUT_SIZE		512
+
+/**
+ * struct hidspi_device - Per‑device HID‑over‑SPI state
+ * @spi:		SPI slave device
+ * @hid:		HID core device (allocated at probe)
+ * @dev_desc:		HIDSPI device descriptor, fetched during probe
+ * @report_desc:	HID report descriptor, fetched during probe
+ * @report_desc_len:	length of @report_desc in bytes
+ * @reset_gpio:		optional GPIO to physically reset the device
+ * @desc_addr:		HID descriptor address from DT ("hid-descr-addr")
+ * @inbuf:		buffer for SPI input reads
+ * @cmdbuf:		buffer for constructing SPI output reports
+ * @frag_buf:		accumulation buffer for multi‑fragment input reports
+ * @frag_len:		number of bytes accumulated in @frag_buf so far
+ * @frag_expected:	expected total content length (from body header of
+ *			first fragment)
+ * @flags:		bitmask of HIDSPI_FLAG_* values
+ * @cmd_lock:		serialises output‑report writes (commands)
+ * @irq_lock:		serialises IRQ‑context input reads vs command waiters
+ * @reset_done:		completion signalled when RESET_RESPONSE arrives
+ * @desc_done:		completion signalled when DEVICE_DESCRIPTOR_RESPONSE
+ *			arrives
+ * @repdesc_done:	completion signalled when REPORT_DESCRIPTOR_RESPONSE
+ *			arrives
+ */
+struct hidspi_device {
+	struct spi_device	*spi;
+	struct hid_device	*hid;
+	struct hidspi_dev_descriptor dev_desc;
+	u8			*report_desc;
+	size_t			report_desc_len;
+	struct gpio_desc	*reset_gpio;
+	u32			desc_addr;
+
+	u8			*inbuf;
+	u8			*cmdbuf;
+	u8			*frag_buf;
+	size_t			frag_len;
+	size_t			frag_expected;
+
+	unsigned long		flags;
+	struct mutex		cmd_lock;
+	struct mutex		irq_lock;
+	struct completion	reset_done;
+	struct completion	desc_done;
+	struct completion	repdesc_done;
+};
+
+/* ------------------------------------------------------------------ */
+/*  Low‑level SPI helpers                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Write an output report to the device.
+ *
+ * The SPI transaction is a simple write on MOSI — the device
+ * recognises the output report by its header.  This is the
+ * host‑to‑device direction of the HIDSPI bus.
+ *
+ * Must be called with cmd_lock held.
+ */
+static int hidspi_write_output(struct hidspi_device *hsdev,
+			       int report_type, int content_id,
+			       const u8 *content, size_t content_len)
+{
+	struct spi_device *spi = hsdev->spi;
+	struct output_report *rep = (struct output_report *)hsdev->cmdbuf;
+	size_t total;
+
+	total = HIDSPI_OUTPUT_REPORT_SIZE(content_len);
+	if (total > PAGE_SIZE)	/* paranoia */
+		return -EINVAL;
+
+	rep->output_hdr.report_type = report_type;
+	rep->output_hdr.content_len = cpu_to_le16(content_len);
+	rep->output_hdr.content_id = content_id;
+
+	if (content && content_len > 0)
+		memcpy(rep->content, content, content_len);
+
+	return spi_write(spi, rep, total);
+}
+
+/*
+ * Read the input header (4 bytes) + input body from the device.
+ * Called from IRQ context.  The input header is at the beginning of
+ * the MISO stream; the host clocks out dummy bytes on MOSI while
+ * the device clocks in data on MISO.
+ *
+ * Returns 0 on success (data in hsdev->inbuf), negative errno otherwise.
+ * On success, *hdr contains the raw 32‑bit input header.
+ */
+static int hidspi_read_input(struct hidspi_device *hsdev,
+			     u32 *hdr, size_t *body_len)
+{
+	struct spi_device *spi = hsdev->spi;
+	int ret;
+	u32 raw_hdr;
+
+	/*
+	 * Read the 4‑byte input header first.  We read it directly
+	 * rather than as part of a larger read so we can inspect
+	 * report_len before allocating more read time.
+	 */
+	ret = spi_read(spi, &raw_hdr, sizeof(raw_hdr));
+	if (ret) {
+		dev_err(&spi->dev, "SPI read for input header failed: %d\n", ret);
+		return ret;
+	}
+
+	*hdr = raw_hdr;
+
+	/* Validate the sync constant before trusting report_len */
+	if (FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr) != 0x5A) {
+		dev_err(&spi->dev,
+			"bad input header sync: 0x%02x (expected 0x5A), raw=0x%08x\n",
+			FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr), raw_hdr);
+		return -EBADMSG;
+	}
+
+	*body_len = FIELD_GET(HIDSPI_INPUT_HEADER_REPORT_LEN, raw_hdr) * sizeof(u32);
+
+	if (*body_len == 0 || *body_len > HIDSPI_MAX_INPUT_SIZE) {
+		dev_err(&spi->dev,
+			"input header body_len out of range: %zu\n", *body_len);
+		return -EBADMSG;
+	}
+
+	/* Read the input body after the header */
+	ret = spi_read(spi, hsdev->inbuf, *body_len);
+	if (ret) {
+		dev_err(&spi->dev, "SPI read for input body failed: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Output commands (host → device) used during probe & PM             */
+/* ------------------------------------------------------------------ */
+
+/* Send SET_POWER command (COMMAND_CONTENT + HIDSPI_SET_POWER_CMD_ID) */
+static int hidspi_set_power(struct hidspi_device *hsdev,
+			    enum hidspi_power_state state)
+{
+	u8 cmd = state;
+	int ret;
+
+	guard(mutex)(&hsdev->cmd_lock);
+
+	ret = hidspi_write_output(hsdev, COMMAND_CONTENT,
+				  HIDSPI_SET_POWER_CMD_ID,
+				  &cmd, sizeof(cmd));
+	if (ret)
+		dev_err(&hsdev->spi->dev,
+			"SET_POWER to %u failed: %d\n", state, ret);
+
+	return ret;
+}
+
+/* Send DEVICE_DESCRIPTOR command to solicit the device descriptor */
+static int hidspi_send_device_descriptor_cmd(struct hidspi_device *hsdev)
+{
+	guard(mutex)(&hsdev->cmd_lock);
+
+	return hidspi_write_output(hsdev, DEVICE_DESCRIPTOR, 0, NULL, 0);
+}
+
+/* Send REPORT_DESCRIPTOR command to solicit the HID report descriptor */
+static int hidspi_send_report_descriptor_cmd(struct hidspi_device *hsdev)
+{
+	guard(mutex)(&hsdev->cmd_lock);
+
+	return hidspi_write_output(hsdev, REPORT_DESCRIPTOR, 0, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Input report dispatch (called from IRQ thread)                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Process a complete, reassembled input report body.
+ *
+ * The body consists of a struct input_report_body_header followed by
+ * the content.  We dispatch by report_type:
+ *
+ *   RESET_RESPONSE             → signal reset_done completion
+ *   DEVICE_DESCRIPTOR_RESPONSE → copy descriptor, signal desc_done
+ *   REPORT_DESCRIPTOR_RESPONSE → copy report descriptor, signal repdesc_done
+ *   COMMAND_RESPONSE            → acknowledgement for SET_POWER etc.
+ *   DATA                        → forward to HID core via hid_input_report
+ *   others                      → log & ignore
+ */
+static void hidspi_handle_input_body(struct hidspi_device *hsdev,
+				     u8 *data, size_t data_len)
+{
+	struct input_report_body_header *body_hdr;
+	struct spi_device *spi = hsdev->spi;
+	size_t content_len;
+	u8 report_type;
+	u8 content_id;
+
+	if (data_len < HIDSPI_INPUT_BODY_HEADER_SIZE) {
+		dev_err(&spi->dev, "input body too short: %zu bytes\n", data_len);
+		return;
+	}
+
+	body_hdr = (struct input_report_body_header *)data;
+	report_type = body_hdr->input_report_type;
+	content_len = le16_to_cpu(body_hdr->content_len);
+	content_id = body_hdr->content_id;
+
+	dev_dbg(&spi->dev, "input report type=%u id=%u len=%zu\n",
+		report_type, content_id, content_len);
+
+	if (HIDSPI_INPUT_BODY_SIZE(content_len) > data_len) {
+		dev_err(&spi->dev,
+			"input body content_len %zu exceeds buffer %zu\n",
+			content_len, data_len - HIDSPI_INPUT_BODY_HEADER_SIZE);
+		return;
+	}
+
+	switch (report_type) {
+	case RESET_RESPONSE:
+		dev_dbg(&spi->dev, "RESET_RESPONSE received\n");
+		complete(&hsdev->reset_done);
+		break;
+
+	case DEVICE_DESCRIPTOR_RESPONSE:
+		if (content_len != HIDSPI_DEVICE_DESCRIPTOR_SIZE) {
+			dev_err(&spi->dev,
+				"unexpected DEVICE_DESCRIPTOR length: %zu (expected %zu)\n",
+				content_len, HIDSPI_DEVICE_DESCRIPTOR_SIZE);
+			return;
+		}
+		memcpy(&hsdev->dev_desc,
+		       data + HIDSPI_INPUT_BODY_HEADER_SIZE,
+		       HIDSPI_DEVICE_DESCRIPTOR_SIZE);
+		dev_dbg(&spi->dev, "DEVICE_DESCRIPTOR received: rep_desc_len=%u\n",
+			le16_to_cpu(hsdev->dev_desc.rep_desc_len));
+		complete(&hsdev->desc_done);
+		break;
+
+	case REPORT_DESCRIPTOR_RESPONSE:
+		if (hsdev->report_desc) {
+			dev_warn(&spi->dev,
+				 "duplicate REPORT_DESCRIPTOR_RESPONSE ignored\n");
+			return;
+		}
+		if (content_len == 0 ||
+		    content_len > HID_MAX_DESCRIPTOR_SIZE) {
+			dev_err(&spi->dev,
+				"bad report descriptor length: %zu\n", content_len);
+			return;
+		}
+		hsdev->report_desc = kmemdup(data + HIDSPI_INPUT_BODY_HEADER_SIZE,
+					     content_len, GFP_KERNEL);
+		if (!hsdev->report_desc)
+			return;
+		hsdev->report_desc_len = content_len;
+		dev_dbg(&spi->dev,
+			"REPORT_DESCRIPTOR received: %zu bytes\n", content_len);
+		complete(&hsdev->repdesc_done);
+		break;
+
+	case COMMAND_RESPONSE:
+		/*
+		 * COMMAND_RESPONSE acknowledges a prior command
+		 * (SET_POWER etc.).  We currently do not need to
+		 * wake a waiter — the commands we use are fire‑and‑forget
+		 * or have their own response types.
+		 */
+		dev_dbg(&spi->dev, "COMMAND_RESPONSE id=%u\n", content_id);
+		break;
+
+	case DATA:
+		if (!test_bit(HIDSPI_FLAG_STARTED, &hsdev->flags))
+			return;
+
+		if (content_len > le16_to_cpu(hsdev->dev_desc.max_input_len)) {
+			dev_err(&spi->dev,
+				"input DATA too large: %zu > max %u\n",
+				content_len,
+				le16_to_cpu(hsdev->dev_desc.max_input_len));
+			return;
+		}
+
+		/*
+		 * The HID report data starts at content_id byte
+		 * (which serves as the HID report ID for numbered
+		 * reports).  Pass the whole thing to hid_input_report;
+		 * it expects the content_id byte + content.
+		 *
+		 * The input_report_body structure packs content_id
+		 * immediately before content[], so content_len +
+		 * sizeof(content_id) bytes starting from &body_hdr->content_id
+		 * is the complete HID input report.
+		 */
+		hid_input_report(hsdev->hid, HID_INPUT_REPORT,
+				 &body_hdr->content_id,
+				 content_len + sizeof(content_id), 1);
+		break;
+
+	default:
+		dev_err(&spi->dev, "unsupported input report type: %u\n",
+			report_type);
+		break;
+	}
+}
+
+/*
+ * Handle an input from the device.  Called from the IRQ thread.
+ *
+ * Reads the input header + body from SPI, validates sync, handles
+ * fragmentation (last_frag_flag), and dispatches complete reports
+ * to hidspi_handle_input_body().
+ *
+ * Fragmentation note:
+ *   When last_frag_flag == 0 the device will send additional
+ *   fragments before the report is complete.  The first fragment
+ *   carries the body header (with total content_len), subsequent
+ *   fragments carry continuation data.  We accumulate in frag_buf
+ *   until the last fragment arrives, then dispatch the whole report.
+ *
+ *   UNCERTAINTY: the exact reassembly algorithm for HIDSPI
+ *   fragmentation has not been tested on real hardware.  The
+ *   implementation below follows the spec (accumulate by fragment
+ *   body into the buffer allocated from the first fragment's
+ *   content_len) but may need adjustment once a multi‑fragment
+ *   device is available.  The initial consumer (d6 touch) sends
+ *   single‑fragment DATA reports, so the accumulation path is
+ *   expected to be exercised only by RESET_RESPONSE / descriptor
+ *   responses.
+ */
+static void hidspi_handle_input(struct hidspi_device *hsdev)
+{
+	struct spi_device *spi = hsdev->spi;
+	u32 hdr;
+	size_t body_len;
+	bool last_frag;
+	int ret;
+
+	ret = hidspi_read_input(hsdev, &hdr, &body_len);
+	if (ret)
+		return;
+
+	last_frag = !!(hdr & HIDSPI_INPUT_HEADER_LAST_FLAG);
+
+	dev_dbg(&spi->dev, "input hdr: ver=%lu report_len=%zu last=%d\n",
+		FIELD_GET(HIDSPI_INPUT_HEADER_VER, hdr),
+		FIELD_GET(HIDSPI_INPUT_HEADER_REPORT_LEN, hdr) * sizeof(u32),
+		last_frag);
+
+	if (last_frag && hsdev->frag_len == 0) {
+		/* Single‑fragment case: dispatch directly */
+		hidspi_handle_input_body(hsdev, hsdev->inbuf, body_len);
+		return;
+	}
+
+	/*
+	 * Multi‑fragment accumulation.
+	 *
+	 * UNCERTAINTY: we do not know the exact fragmentation
+	 * behaviour of the d6 controller or any other HIDSPI device
+	 * on a bare SPI bus.  The logic below is written to the spec
+	 * but may need fine‑tuning.
+	 */
+	if (hsdev->frag_len == 0) {
+		/* First fragment: peek at body header for total content_len */
+		struct input_report_body_header *body_hdr;
+
+		if (body_len < HIDSPI_INPUT_BODY_HEADER_SIZE) {
+			dev_err(&spi->dev,
+				"first frag too short for body header\n");
+			return;
+		}
+
+		body_hdr = (struct input_report_body_header *)hsdev->inbuf;
+		hsdev->frag_expected = le16_to_cpu(body_hdr->content_len) +
+				      HIDSPI_INPUT_BODY_HEADER_SIZE;
+
+		if (hsdev->frag_expected > HIDSPI_MAX_INPUT_SIZE) {
+			dev_err(&spi->dev,
+				"frag total expected too large: %zu\n",
+				hsdev->frag_expected);
+			return;
+		}
+
+		hsdev->frag_buf = kmalloc(hsdev->frag_expected, GFP_KERNEL);
+		if (!hsdev->frag_buf)
+			return;
+
+		memcpy(hsdev->frag_buf, hsdev->inbuf, body_len);
+		hsdev->frag_len = body_len;
+	} else {
+		/* Continuation fragment: append */
+		if (hsdev->frag_len + body_len > hsdev->frag_expected) {
+			dev_err(&spi->dev,
+				"frag overflow: have %zu + %zu > expected %zu\n",
+				hsdev->frag_len, body_len,
+				hsdev->frag_expected);
+			/* Discard the accumulated data */
+			kfree(hsdev->frag_buf);
+			hsdev->frag_buf = NULL;
+			hsdev->frag_len = 0;
+			hsdev->frag_expected = 0;
+			return;
+		}
+
+		memcpy(hsdev->frag_buf + hsdev->frag_len, hsdev->inbuf, body_len);
+		hsdev->frag_len += body_len;
+	}
+
+	if (last_frag) {
+		/*
+		 * All fragments received.  Dispatch the reassembled
+		 * body and release the accumulation buffer.
+		 */
+		hidspi_handle_input_body(hsdev, hsdev->frag_buf, hsdev->frag_len);
+		kfree(hsdev->frag_buf);
+		hsdev->frag_buf = NULL;
+		hsdev->frag_len = 0;
+		hsdev->frag_expected = 0;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/*  Interrupt handler                                                  */
+/* ------------------------------------------------------------------ */
+
+static irqreturn_t hidspi_irq_thread(int irq, void *dev_id)
+{
+	struct hidspi_device *hsdev = dev_id;
+
+	mutex_lock(&hsdev->irq_lock);
+	hidspi_handle_input(hsdev);
+	mutex_unlock(&hsdev->irq_lock);
+
+	return IRQ_HANDLED;
+}
+
+/* ------------------------------------------------------------------ */
+/*  HID low‑level driver callbacks (modeled on i2c‑hid + quickspi)     */
+/* ------------------------------------------------------------------ */
+
+static int hidspi_hid_parse(struct hid_device *hid)
+{
+	struct hidspi_device *hsdev = hid->driver_data;
+
+	if (!hsdev->report_desc)
+		return -EINVAL;
+
+	return hid_parse_report(hid, hsdev->report_desc,
+				hsdev->report_desc_len);
+}
+
+static int hidspi_hid_start(struct hid_device *hid)
+{
+	return 0;
+}
+
+static void hidspi_hid_stop(struct hid_device *hid)
+{
+}
+
+static int hidspi_hid_open(struct hid_device *hid)
+{
+	struct hidspi_device *hsdev = hid->driver_data;
+
+	set_bit(HIDSPI_FLAG_STARTED, &hsdev->flags);
+	return 0;
+}
+
+static void hidspi_hid_close(struct hid_device *hid)
+{
+	struct hidspi_device *hsdev = hid->driver_data;
+
+	clear_bit(HIDSPI_FLAG_STARTED, &hsdev->flags);
+}
+
+static int hidspi_hid_output_report(struct hid_device *hid, u8 *buf, size_t count)
+{
+	struct hidspi_device *hsdev = hid->driver_data;
+	u8 report_id = buf[0];
+	int ret;
+
+	/*
+	 * Strip the report ID byte — the payload is buf[1..count-1].
+	 * The content_id field of the output header carries the report ID.
+	 */
+	guard(mutex)(&hsdev->cmd_lock);
+
+	ret = hidspi_write_output(hsdev, OUTPUT_REPORT,
+				  report_id, buf + 1, count - 1);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static int hidspi_hid_raw_request(struct hid_device *hid,
+				  unsigned char reportnum,
+				  __u8 *buf, size_t len,
+				  unsigned char rtype, int reqtype)
+{
+	/*
+	 * Raw get/set feature requests are not implemented yet.
+	 * The d6 touch controller does not appear to use feature
+	 * reports in the GPL‑visible DT, and the GET_FEATURE /
+	 * SET_FEATURE HIDSPI commands require a synchronous
+	 * command‑response dance that this driver has not wired up.
+	 *
+	 * UNCERTAINTY: a full implementation would need to send
+	 * GET_FEATURE / SET_FEATURE output reports, wait for the
+	 * corresponding response in the IRQ handler, and return the
+	 * result.  This is omitted for the initial version.
+	 */
+	return -EOPNOTSUPP;
+}
+
+static const struct hid_ll_driver hidspi_hid_ll_driver = {
+	.parse		= hidspi_hid_parse,
+	.start		= hidspi_hid_start,
+	.stop		= hidspi_hid_stop,
+	.open		= hidspi_hid_open,
+	.close		= hidspi_hid_close,
+	.output_report	= hidspi_hid_output_report,
+	.raw_request	= hidspi_hid_raw_request,
+};
+
+/* ------------------------------------------------------------------ */
+/*  Descriptor fetch (HIDSPI command → response, with completion)      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Fetch the HIDSPI device descriptor by sending DEVICE_DESCRIPTOR
+ * and waiting for the DEVICE_DESCRIPTOR_RESPONSE input report.
+ * The response is captured in the IRQ thread.
+ */
+static int hidspi_fetch_device_descriptor(struct hidspi_device *hsdev)
+{
+	struct spi_device *spi = hsdev->spi;
+	int ret;
+
+	reinit_completion(&hsdev->desc_done);
+
+	ret = hidspi_send_device_descriptor_cmd(hsdev);
+	if (ret) {
+		dev_err(&spi->dev,
+			"failed to send DEVICE_DESCRIPTOR cmd: %d\n", ret);
+		return ret;
+	}
+
+	ret = wait_for_completion_timeout(&hsdev->desc_done,
+					  HIDSPI_CMD_TIMEOUT);
+	if (ret == 0) {
+		dev_err(&spi->dev, "timeout waiting for DEVICE_DESCRIPTOR\n");
+		return -ETIMEDOUT;
+	}
+
+	/* Validate the descriptor */
+	if (le16_to_cpu(hsdev->dev_desc.dev_desc_len) !=
+	    HIDSPI_DEVICE_DESCRIPTOR_SIZE) {
+		dev_err(&spi->dev,
+			"unexpected device descriptor length: %u (expected %zu)\n",
+			le16_to_cpu(hsdev->dev_desc.dev_desc_len),
+			HIDSPI_DEVICE_DESCRIPTOR_SIZE);
+		return -ENODEV;
+	}
+
+	if (le16_to_cpu(hsdev->dev_desc.bcd_ver) != 0x0300) {
+		dev_err(&spi->dev,
+			"unsupported HIDSPI protocol version: 0x%04x\n",
+			le16_to_cpu(hsdev->dev_desc.bcd_ver));
+		return -ENODEV;
+	}
+
+	dev_dbg(&spi->dev,
+		"HIDSPI descriptor: ver=0x%04x report_desc_len=%u max_input=%u\n",
+		le16_to_cpu(hsdev->dev_desc.bcd_ver),
+		le16_to_cpu(hsdev->dev_desc.rep_desc_len),
+		le16_to_cpu(hsdev->dev_desc.max_input_len));
+
+	return 0;
+}
+
+/*
+ * Fetch the HID report descriptor by sending REPORT_DESCRIPTOR and
+ * waiting for the REPORT_DESCRIPTOR_RESPONSE input report.
+ */
+static int hidspi_fetch_report_descriptor(struct hidspi_device *hsdev)
+{
+	struct spi_device *spi = hsdev->spi;
+	int ret;
+
+	reinit_completion(&hsdev->repdesc_done);
+
+	ret = hidspi_send_report_descriptor_cmd(hsdev);
+	if (ret) {
+		dev_err(&spi->dev,
+			"failed to send REPORT_DESCRIPTOR cmd: %d\n", ret);
+		return ret;
+	}
+
+	ret = wait_for_completion_timeout(&hsdev->repdesc_done,
+					  HIDSPI_CMD_TIMEOUT);
+	if (ret == 0) {
+		dev_err(&spi->dev, "timeout waiting for REPORT_DESCRIPTOR\n");
+		return -ETIMEDOUT;
+	}
+
+	if (!hsdev->report_desc) {
+		dev_err(&spi->dev, "REPORT_DESCRIPTOR received but buffer is NULL\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Physical reset (GPIO toggle, followed by RESET_RESPONSE wait)      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Toggle the optional reset GPIO and wait for the device to respond
+ * with a RESET_RESPONSE input report.
+ *
+ * After the RESET_RESPONSE arrives, the device expects the host to
+ * fetch the device descriptor next.
+ */
+static int hidspi_reset_device(struct hidspi_device *hsdev)
+{
+	struct spi_device *spi = hsdev->spi;
+	int ret;
+
+	if (!hsdev->reset_gpio) {
+		/*
+		 * No reset GPIO — the device should send a
+		 * "device‑initiated reset" (DIR) when it powers up.
+		 * We still wait for a RESET_RESPONSE if one arrives,
+		 * but do not block probe on it.
+		 *
+		 * UNCERTAINTY: some HIDSPI devices may not send a
+		 * RESET_RESPONSE without an explicit host‑side reset.
+		 * In that case the first IRQ we receive will be for
+		 * the DEVICE_DESCRIPTOR_RESPONSE.  This is untested.
+		 */
+		dev_dbg(&spi->dev, "no reset GPIO — skipping physical reset\n");
+
+		/*
+		 * Give the device a moment to complete its own
+		 * power‑on sequence before we issue the descriptor
+		 * command.
+		 */
+		msleep(100);
+		return 0;
+	}
+
+	reinit_completion(&hsdev->reset_done);
+
+	dev_dbg(&spi->dev, "asserting reset GPIO\n");
+	gpiod_set_value_cansleep(hsdev->reset_gpio, 1);
+	msleep(10);
+	gpiod_set_value_cansleep(hsdev->reset_gpio, 0);
+	msleep(10);
+
+	ret = wait_for_completion_timeout(&hsdev->reset_done,
+					  HIDSPI_CMD_TIMEOUT);
+	if (ret == 0) {
+		dev_warn(&spi->dev,
+			 "timeout waiting for RESET_RESPONSE — continuing\n");
+		/*
+		 * Some devices may not send RESET_RESPONSE
+		 * (especially if they were already awake).
+		 * Continue anyway.
+		 */
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Probe / remove                                                      */
+/* ------------------------------------------------------------------ */
+
+static int hidspi_probe(struct spi_device *spi)
+{
+	struct device *dev = &spi->dev;
+	struct hidspi_device *hsdev;
+	struct hid_device *hid;
+	u32 desc_addr = 1;	/* default: address 1 as per HIDSPI convention */
+	int ret;
+
+	/*
+	 * The SPI device must have an interrupt line — we cannot
+	 * receive input reports without it.
+	 */
+	if (spi->irq <= 0) {
+		dev_err(dev, "no IRQ specified for HID-over-SPI device\n");
+		return -EINVAL;
+	}
+
+	hsdev = devm_kzalloc(dev, sizeof(*hsdev), GFP_KERNEL);
+	if (!hsdev)
+		return -ENOMEM;
+
+	hsdev->spi = spi;
+	spi_set_drvdata(spi, hsdev);
+
+	/* Optional hid-descr-addr from DT */
+	device_property_read_u32(dev, "hid-descr-addr", &desc_addr);
+	hsdev->desc_addr = desc_addr;
+
+	/* Optional reset GPIO */
+	hsdev->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(hsdev->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(hsdev->reset_gpio),
+				     "failed to get reset GPIO\n");
+
+	mutex_init(&hsdev->cmd_lock);
+	mutex_init(&hsdev->irq_lock);
+	init_completion(&hsdev->reset_done);
+	init_completion(&hsdev->desc_done);
+	init_completion(&hsdev->repdesc_done);
+
+	/* Allocate buffers for input reads and output commands */
+	hsdev->inbuf = devm_kzalloc(dev, HIDSPI_MAX_INPUT_SIZE, GFP_KERNEL);
+	hsdev->cmdbuf = devm_kzalloc(dev, PAGE_SIZE, GFP_KERNEL);
+	if (!hsdev->inbuf || !hsdev->cmdbuf)
+		return -ENOMEM;
+
+	/*
+	 * Set up the SPI bus parameters.
+	 * Mode 0 (CPOL=0, CPHA=0) is the HIDSPI default.
+	 */
+	spi->mode = SPI_MODE_0;
+	spi->bits_per_word = 8;
+	ret = spi_setup(spi);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "spi_setup failed\n");
+
+	/*
+	 * Request a threaded interrupt handler.  The top‑half is NULL
+	 * (we don't need hard‑IRQ context for SPI reads) and the
+	 * thread does the SPI read + dispatch.  We start with the IRQ
+	 * disabled so that the descriptor‑fetch commands can complete
+	 * synchronously under irq_lock without racing the handler.
+	 */
+	ret = devm_request_threaded_irq(dev, spi->irq,
+					NULL, hidspi_irq_thread,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					dev_name(dev), hsdev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request IRQ %d\n",
+				     spi->irq);
+
+	/*
+	 * Power on and reset.  The reset will send a RESET_RESPONSE
+	 * input report if the device supports it.  Even without a
+	 * reset GPIO the device may still send a DIR (device‑initiated
+	 * reset) when it sees the bus active.
+	 *
+	 * Enable IRQ briefly so that we can receive the
+	 * RESET_RESPONSE, DEVICE_DESCRIPTOR_RESPONSE, and
+	 * REPORT_DESCRIPTOR_RESPONSE during the probe sequence.
+	 */
+	enable_irq(spi->irq);
+
+	ret = hidspi_reset_device(hsdev);
+	if (ret)
+		goto err_disable_irq;
+
+	/*
+	 * Send SET_POWER(HIDSPI_ON) to wake the device (it may have
+	 * been in SLEEP after reset).  We do not wait for a
+	 * COMMAND_RESPONSE here.
+	 */
+	ret = hidspi_set_power(hsdev, HIDSPI_ON);
+	if (ret)
+		dev_warn(dev, "SET_POWER ON failed: %d — continuing\n", ret);
+
+	/*
+	 * Fetch the HIDSPI device descriptor.  This is a
+	 * command (DEVICE_DESCRIPTOR output) → response
+	 * (DEVICE_DESCRIPTOR_RESPONSE input) cycle.
+	 */
+	ret = hidspi_fetch_device_descriptor(hsdev);
+	if (ret)
+		goto err_disable_irq;
+
+	/* Fetch the HID report descriptor */
+	ret = hidspi_fetch_report_descriptor(hsdev);
+	if (ret)
+		goto err_disable_irq;
+
+	/*
+	 * Now register with the HID subsystem.
+	 * hidspi_hid_parse() will be called during hid_add_device()
+	 * to parse the report descriptor we just fetched.
+	 */
+	hid = hid_allocate_device();
+	if (IS_ERR(hid)) {
+		ret = PTR_ERR(hid);
+		goto err_free_report_desc;
+	}
+
+	hsdev->hid = hid;
+	hid->driver_data = hsdev;
+	hid->ll_driver = &hidspi_hid_ll_driver;
+	hid->dev.parent = dev;
+	hid->bus = BUS_VIRTUAL;
+	hid->version = le16_to_cpu(hsdev->dev_desc.version_id);
+	hid->vendor = le16_to_cpu(hsdev->dev_desc.vendor_id);
+	hid->product = le16_to_cpu(hsdev->dev_desc.product_id);
+
+	snprintf(hid->name, sizeof(hid->name), "%s %04X:%04X",
+		 dev_name(dev), hid->vendor, hid->product);
+	strscpy(hid->phys, dev_name(dev), sizeof(hid->phys));
+
+	ret = hid_add_device(hid);
+	if (ret) {
+		dev_err(dev, "failed to add HID device: %d\n", ret);
+		goto err_destroy_hid;
+	}
+
+	/*
+	 * IRQ stays enabled — the device now sends DATA input
+	 * reports (touch) and they are forwarded to the HID core.
+	 */
+
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_set_autosuspend_delay(dev, 5000);
+
+	dev_info(dev,
+		 "HID-over-SPI device probed: vendor=%04x product=%04x\n",
+		 hid->vendor, hid->product);
+
+	return 0;
+
+err_destroy_hid:
+	hid_destroy_device(hid);
+err_free_report_desc:
+	kfree(hsdev->report_desc);
+	hsdev->report_desc = NULL;
+err_disable_irq:
+	disable_irq(spi->irq);
+	return ret;
+}
+
+static void hidspi_remove(struct spi_device *spi)
+{
+	struct hidspi_device *hsdev = spi_get_drvdata(spi);
+
+	pm_runtime_disable(&spi->dev);
+
+	if (hsdev->hid)
+		hid_destroy_device(hsdev->hid);
+
+	kfree(hsdev->report_desc);
+	kfree(hsdev->frag_buf);
+	hsdev->report_desc = NULL;
+	hsdev->frag_buf = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Power management                                                    */
+/* ------------------------------------------------------------------ */
+
+static int hidspi_pm_suspend(struct device *dev)
+{
+	struct hidspi_device *hsdev = dev_get_drvdata(dev);
+	struct hid_device *hid = hsdev->hid;
+	int ret;
+
+	if (hid) {
+		ret = hid_driver_suspend(hid, PMSG_SUSPEND);
+		if (ret < 0)
+			return ret;
+	}
+
+	disable_irq(hsdev->spi->irq);
+
+	ret = hidspi_set_power(hsdev, HIDSPI_SLEEP);
+	if (ret)
+		dev_warn(dev, "SET_POWER SLEEP failed: %d\n", ret);
+
+	return 0;
+}
+
+static int hidspi_pm_resume(struct device *dev)
+{
+	struct hidspi_device *hsdev = dev_get_drvdata(dev);
+	int ret;
+
+	ret = hidspi_set_power(hsdev, HIDSPI_ON);
+	if (ret)
+		dev_warn(dev, "SET_POWER ON failed: %d\n", ret);
+
+	enable_irq(hsdev->spi->irq);
+
+	if (hsdev->hid)
+		return hid_driver_reset_resume(hsdev->hid);
+
+	return 0;
+}
+
+static int hidspi_runtime_suspend(struct device *dev)
+{
+	struct hidspi_device *hsdev = dev_get_drvdata(dev);
+
+	return hidspi_set_power(hsdev, HIDSPI_SLEEP);
+}
+
+static int hidspi_runtime_resume(struct device *dev)
+{
+	struct hidspi_device *hsdev = dev_get_drvdata(dev);
+
+	return hidspi_set_power(hsdev, HIDSPI_ON);
+}
+
+static const struct dev_pm_ops hidspi_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(hidspi_pm_suspend, hidspi_pm_resume)
+	RUNTIME_PM_OPS(hidspi_runtime_suspend, hidspi_runtime_resume, NULL)
+};
+
+/* ------------------------------------------------------------------ */
+/*  OF match table & SPI driver                                        */
+/* ------------------------------------------------------------------ */
+
+static const struct of_device_id hidspi_of_match[] = {
+	{ .compatible = "hid-over-spi" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, hidspi_of_match);
+
+static struct spi_driver hidspi_driver = {
+	.driver = {
+		.name		= "hid-over-spi",
+		.of_match_table	= hidspi_of_match,
+		.pm		= pm_sleep_ptr(&hidspi_pm_ops),
+	},
+	.probe	= hidspi_probe,
+	.remove	= hidspi_remove,
+};
+module_spi_driver(hidspi_driver);
+
+MODULE_DESCRIPTION("HID over SPI (MIPI HIDSPI) transport driver");
+MODULE_AUTHOR("Linux Surface Duo 2 porting effort");
+MODULE_LICENSE("GPL");
