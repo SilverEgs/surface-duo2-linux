@@ -48,14 +48,21 @@ Device tree ground truth in `artifacts/reference/` (pure-python FDT dumper, no d
 - boot partition has NO dtb (0 blobs); dtb lives in vendor_boot (base) +
   dtbo (overlays). boot header version = 3, page size 4096.
 
-## Build toolchain status (vm-hermes)
+## Build status (vm-hermes) — WORKING
 
-- No sudo (interactive password). No flex/bison/yaml. `dtc` NOT installed;
-  use `tools/fdt2dts.py` (pure-python) for FDT->DTS — proven correct.
-- Cross toolchain: Bootlin `aarch64--glibc--stable-2024.02-1` (gcc 12.3.0),
-  at `tools/toolchains/`. Source `tools/env.sh` for CROSS_COMPILE/ARCH=arm64.
-  Verified: emits aarch64 ELF.
-- Mainline kernel: shallow clone at `src/linux` (torvalds, HEAD).
+- Cross toolchain: Bootlin `aarch64--glibc--stable-2024.02-1` (gcc 12.3.0) at
+  `tools/toolchains/`; it ALSO bundles host tools `bison`/`m4`/`python3`.
+- `flex` was the one missing host tool (needed by Kconfig); built from source to
+  `tools/hosttools/` (no sudo). `source tools/env.sh` sets PATH + `CROSS_COMPILE`
+  + `ARCH=arm64`.
+- Build recipe (out-of-tree): `make O=../build defconfig` →
+  `scripts/config --file ../build/.config --module DRM_PANEL_ELGIN --module HID_OVER_SPI`
+  → `make O=../build olddefconfig prepare`.
+  **Both drivers compile clean (zero warnings)** against this tree.
+- `dtc` still not installed (no sudo) — use `tools/fdt2dts.py` for DTB→DTS.
+- Mainline kernel: shallow clone at `src/linux` (torvalds HEAD). Vendor source:
+  GitHub `microsoft/surface-duo-oss-*` (NOT Azure Devops), branch
+  `surfaceduo2/11/2023.501.24`, sparse-blobless-cloned under `src/vendor/`.
 
 ## Phase 1 — upstream gap analysis (KEY FINDING)
 

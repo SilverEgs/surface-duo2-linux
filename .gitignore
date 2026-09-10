@@ -19,4 +19,4 @@ tools/dump-phase0.sh
 *.img
 *.dtb
 *.dts
-*.bin
+*.bintools/hosttools/
