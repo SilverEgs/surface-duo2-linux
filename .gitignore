@@ -1,0 +1,22 @@
+# Private / device-unique — never publish
+artifacts/
+
+# Large / regenerable
+logs/
+out/
+build/
+src/
+tools/toolchains/
+tools/platform-tools/
+tools/bin/
+tools/dtc-1.7.2/
+tools/dtc.tar.xz
+
+# Device-specific script (hardcoded serial + private artifact paths)
+tools/dump-phase0.sh
+
+# Raw binary artifacts and decompiled trees
+*.img
+*.dtb
+*.dts
+*.bin
