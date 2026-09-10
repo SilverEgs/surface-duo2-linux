@@ -79,4 +79,4 @@ published**), `src/` (kernel source trees), `tools/toolchains/` (cross compiler)
 
 ## License
 
-TBD — pending owner decision.
+GPL-2.0 — see `LICENSE`.
