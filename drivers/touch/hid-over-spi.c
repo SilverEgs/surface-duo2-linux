@@ -167,7 +167,8 @@ static int hidspi_read_input(struct hidspi_device *hsdev,
 	if (FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr) != 0x5A) {
 		dev_err(&spi->dev,
 			"bad input header sync: 0x%02x (expected 0x5A), raw=0x%08x\n",
-			FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr), raw_hdr);
+			(u32)FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr),
+			(u32)raw_hdr);
 		return -EBADMSG;
 	}
 

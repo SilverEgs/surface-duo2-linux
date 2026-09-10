@@ -100,10 +100,10 @@ index 000000000..8ff7273a5
 \ No newline at end of file
 diff --git a/drivers/hid/hid-over-spi.c b/drivers/hid/hid-over-spi.c
 new file mode 100644
-index 000000000..471d1d9a4
+index 000000000..b27b45a39
 --- /dev/null
 +++ b/drivers/hid/hid-over-spi.c
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1006 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * HID over SPI transport driver (MIPI HIDSPI protocol)
@@ -273,7 +273,8 @@ index 000000000..471d1d9a4
 +	if (FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr) != 0x5A) {
 +		dev_err(&spi->dev,
 +			"bad input header sync: 0x%02x (expected 0x5A), raw=0x%08x\n",
-+			FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr), raw_hdr);
++			(u32)FIELD_GET(HIDSPI_INPUT_HEADER_SYNC, raw_hdr),
++			(u32)raw_hdr);
 +		return -EBADMSG;
 +	}
 +
