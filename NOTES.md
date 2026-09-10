@@ -59,6 +59,17 @@ Device tree ground truth in `artifacts/reference/` (pure-python FDT dumper, no d
   `scripts/config --file ../build/.config --module DRM_PANEL_ELGIN --module HID_OVER_SPI`
   → `make O=../build olddefconfig prepare`.
   **Both drivers compile clean (zero warnings)** against this tree.
+- **CONFIG GOTCHA (cost 3 rebuilds):** running `make Image` with `ARCH=x86`
+  (host default) silently re-syncs the O= config for x86 and DISABLES
+  `CONFIG_ARCH_QCOM`, which cascades to `DRM_MSM=n` (its `depends on
+  ARCH_QCOM` fails) and kills the whole Qualcomm build. ALWAYS pass
+  `ARCH=arm64 CROSS_COMPILE=aarch64-linux-` explicitly on every make line.
+  Also: `DRM_MSM=y` needs its `QCOM_*` deps at =y or =n (not =m) — the
+  `X || X=n` pattern. In the arm64 defconfig, `QCOM_LLCC=m` and `QCOM_OCMEM=m`
+  block it; fix with `-e QCOM_LLCC -d QCOM_OCMEM`. Final working config:
+  `ARCH_QCOM=y DRM=y DRM_MSM=y DRM_PANEL_ELGIN=y HID_OVER_SPI=y
+  BACKLIGHT_CLASS_DEVICE=y` → 53 MB Image with msm_drm/dpu/elgin/hidspi
+  all built-in (verified via System.map).
 - `dtc` still not installed (no sudo) — use `tools/fdt2dts.py` for DTB→DTS.
 - Mainline kernel: shallow clone at `src/linux` (torvalds HEAD). Vendor source:
   GitHub `microsoft/surface-duo-oss-*` (NOT Azure Devops), branch
