@@ -11,6 +11,7 @@ tools/platform-tools/
 tools/bin/
 tools/dtc-1.7.2/
 tools/dtc.tar.xz
+tools/hosttools/
 
 # Device-specific script (hardcoded serial + private artifact paths)
 tools/dump-phase0.sh
@@ -19,7 +20,7 @@ tools/dump-phase0.sh
 *.img
 *.dtb
 *.dts
-*.bintools/hosttools/
+*.bin
 *.cpio
 boot.img
 vendor_boot.img
