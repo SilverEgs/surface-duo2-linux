@@ -101,3 +101,24 @@ Since the physical UART is inaccessible, the next diagnostic is pstore/ramoops:
 `CONFIG_PSTORE_RAM=y` + a `compatible = "ramoops"` reserved-memory node
 (1 MiB at `0x1_0000_0000`) so the panic reason survives into RAM. Boot → crash
 → read the region from TWRP to get the actual `Kernel panic - not syncing: …`.
+
+### pstore/ramoops attempt — armed but not readable
+
+Enabled `CONFIG_PSTORE_RAM=y` + `PSTORE_CONSOLE` + `PSTORE_PMSG`, added a
+`compatible = "ramoops"` node (1 MiB at `0x1_0000_0000`), rebuilt, flashed, and
+crashed the kernel on cue. But reading it back hit two walls:
+
+1. **TWRP's downstream kernel blocks raw RAM reads** — no `/dev/mem` device, and
+   `mknod /dev/mem c 1 1` + `devmem` returns `No such device or address`
+   (`STRICT_DEVMEM`), so I can't dump the region from recovery.
+2. **The vendor's own ramoops is the "safe" address.** The stock dtb reserves
+   `ramoops` at **`0xA9000000` (2 MiB, `pmsg`-only)** — that region survives the
+   UEFI reboot (their crash path relies on it), whereas my `0x1_0000_0000`
+   choice may be re-initialised by the UEFI. But the vendor node is `pmsg`-only
+   (no `record-size`/`console-size`), so it can't capture a kernel *panic*
+   dmesg without a layout mismatch that Android would then mis-read.
+
+Net: the crash is still invisible without a hardware UART. The next useful step
+is (a) solder a UART to the serial test points, or (b) move the ramoops to the
+vendor `0xA9000000` region *and* rebuild a downstream kernel with matching
+`record-size` so Android/TWRP can read it back through its own pstore.

@@ -98,3 +98,15 @@ The Duo 2 uses Microsoft UEFI, but boots Android the *standard* way: header-v3
 the UEFI boot menu (`Start / Recover / Power off`), which presents as `045e:0c2f`
 on USB just like raw fastboot — the menu == "boot failed or needs manual
 selection", not a different device state.
+
+## 13. Reading pstore back needs a matching layout + a memory path
+
+Reading a crash's pstore from a *different* boot only works if the region
+survives the boot chain **and** the reading kernel can reach it. Two traps:
+(a) a UEFI device may re-initialise an *arbitrary* RAM address you picked — use
+the **vendor's own ramoops/rstdump address** instead (it's guaranteed to survive;
+on the Duo 2 it's `0xA9000000`, 2 MiB), and (b) the recovery kernel usually ships
+`STRICT_DEVMEM` (no `/dev/mem`), so `devmem`/`dd` can't read raw RAM — the reading
+kernel must mount pstore itself via a DT node **matching your layout** (same
+address *and* same `record-size`/`console-size`/`pmsg-size`), or the records
+mis-parse.
