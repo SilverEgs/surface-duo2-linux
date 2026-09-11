@@ -5,8 +5,11 @@ Android phone) as a base for a Hyprland-on-Wayland mobile desktop. This tracks
 the reverse-engineering, driver-authoring, and bring-up effort for the
 dual-screen-specific hardware that upstream Linux does not yet support.
 
-> Status: **drivers authored + compile-verified, kernel built (display + touch
-> built-in), boot image packed. Next: boot test on hardware.**
+> Status: **drivers authored + compile-verified, kernel built (display + touch +
+> built-in). Boot bring-up in progress** — the mainline kernel does not boot yet
+> (returns to the UEFI menu), and the downstream 5.4 QGKI kernel is confirmed
+> bootable. Diagnosing the early crash via pstore/ramoops. See
+> [docs/progress.md](docs/progress.md).
 
 > **Assisted project** — research, orchestration, and verification by
 > [Hermes](https://hermes-agent.nousresearch.com) (Nous Research's agentic
