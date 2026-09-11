@@ -115,3 +115,33 @@ Priority for a booting Linux: the board file already gives console+UFS+USB
 (silent bring-up target is a USB ACM/serial console — reachable without ANY
 display/touch work). Display (elgin panels) is the first authored milestone
 and the hard part; touch (d6) is second.
+
+---
+
+## Boot bring-up status (stock QGKI kernel + initramfs) — IN PROGRESS
+
+CONFIRMED: the extracted stock kernel (5.4 QGKI, `boot_a`'s prebuilt `kernel`)
+boots a custom static-busybox initramfs and runs `/init` (evidenced by an
+intentional boot loop from the diagnostic init). This is the fastest round-trip
+to booting Linux on the device — no display/touch drivers needed yet.
+
+THE BLOCKER is a console/visibility channel, not the boot itself:
+- No UART (case stays closed).
+- No screen console: QGKI kernel has `CONFIG_VT` and `DRM_FBDEV_EMULATION` unset,
+  so `console=tty0` is impossible; the "static Windows logo" is just the
+  bootloader's frozen frame.
+- USB gadget: only `USB_CONFIGFS_ACM`+`NCM` are `=y` (no RNDIS/ECM, no
+  `U_SERIAL_CONSOLE`) — so the target is a configfs ACM serial gadget. Tried:
+  `dr_mode=peripheral` + removing the `extcon` property (`qcom,msm-eud` phandle
+  that makes `dwc3-qcom` defer forever). dtb patches are valid and packed, but
+  the device still drops off USB (no enumerate).
+- pstore/pmsg: `/dev/pmsg0` write succeeds but the region does NOT survive the
+  reboot (ramoops `mem_type=0` in recovery; region returned empty). Not a
+  reliable console path yet.
+
+REMAINING HYPOTHESES (all need console visibility to disambiguate): the Type-C
+CC-pin/role configuration, the USB QMP PHY not powering for device mode, or
+another `dwc3-qcom` probe dependency.
+
+NEXT: mirror the known-working USB setup from the postmarketOS Duo 2 port
+(their wiki lists "USB Networking: Works").

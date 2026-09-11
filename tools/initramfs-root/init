@@ -1,0 +1,43 @@
+#!/bin/sh
+
+# --- mount essentials ---
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox mkdir -p /dev/pts /tmp /run /sys/kernel/config
+/bin/busybox mount -t devpts devpts /dev/pts 2>/dev/null
+/bin/busybox mount -t configfs none /sys/kernel/config 2>/dev/null
+
+/bin/busybox echo "duo2: init up" > /dev/kmsg 2>/dev/null
+
+# --- CDC-ACM serial gadget (USB_CONFIGFS_ACM=y) ---
+G=/sys/kernel/config/usb_gadget/g1
+/bin/busybox mkdir -p $G 2>/dev/null
+/bin/busybox echo 0x045e > $G/idVendor 2>/dev/null
+/bin/busybox echo 0x4e26 > $G/idProduct 2>/dev/null
+/bin/busybox echo 0x0100 > $G/bcdDevice 2>/dev/null
+/bin/busybox echo 0x0200 > $G/bcdUSB 2>/dev/null
+/bin/busybox mkdir -p $G/strings/0x409 2>/dev/null
+/bin/busybox echo "duo2linux" > $G/strings/0x409/serialnumber 2>/dev/null
+/bin/busybox mkdir -p $G/functions/acm.gs0 2>/dev/null
+/bin/busybox mkdir -p $G/configs/c.1 2>/dev/null
+/bin/busybox echo 250 > $G/configs/c.1/MaxPower 2>/dev/null
+/bin/busybox ln -s $G/functions/acm.gs0 $G/configs/c.1/ 2>/dev/null
+
+UDC=$(/bin/busybox ls /sys/class/udc/ 2>/dev/null | /bin/busybox head -n1)
+if [ -n "$UDC" ]; then
+    /bin/busybox echo "$UDC" > $G/UDC 2>/dev/null
+    /bin/busybox echo "duo2: gadget bound to $UDC" > /dev/kmsg 2>/dev/null
+else
+    /bin/busybox echo "duo2: NO UDC (dwc3 not in device mode?)" > /dev/kmsg 2>/dev/null
+fi
+
+# --- shells on the serial gadget ---
+while :; do
+    for t in /dev/ttyGS0 /dev/ttyGS1 /dev/ttyACM0; do
+        if [ -c "$t" ]; then
+            /bin/busybox getty -L -l /bin/busybox/sh "$t" 115200 vt100 2>/dev/null
+        fi
+    done
+    /bin/busybox sleep 2
+done
