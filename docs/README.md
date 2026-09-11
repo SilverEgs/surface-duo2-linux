@@ -6,6 +6,10 @@ Qualcomm SM8350 "lahaina") as a base for a Hyprland-on-Wayland mobile desktop.
 This wiki tracks the reverse-engineering, driver-authoring, and bring-up work.
 Every page is the shareable record of what was found, built, and learned.
 
+> **Assisted project** — research, orchestration, and verification by
+> [Hermes](https://hermes-agent.nousresearch.com) (Nous Research); driver
+> authoring and code review by [Claude Code](https://claude.ai/code) (Anthropic).
+
 ## Status at a glance
 
 | Milestone | State |

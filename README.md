@@ -5,8 +5,13 @@ Android phone) as a base for a Hyprland-on-Wayland mobile desktop. This tracks
 the reverse-engineering, driver-authoring, and bring-up effort for the
 dual-screen-specific hardware that upstream Linux does not yet support.
 
-> Status: **Phase 0 (backup + device-tree ground truth) and Phase 1 (gap
-> analysis + toolchain) are complete. Driver authoring is in progress.**
+> Status: **drivers authored + compile-verified, kernel built (display + touch
+> built-in), boot image packed. Next: boot test on hardware.**
+
+> **Assisted project** — research, orchestration, and verification by
+> [Hermes](https://hermes-agent.nousresearch.com) (Nous Research's agentic
+> runtime); driver authoring and code review by
+> [Claude Code](https://claude.ai/code) (Anthropic).
 
 ## Device
 
