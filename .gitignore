@@ -25,3 +25,6 @@ tools/dump-phase0.sh
 boot.img
 vendor_boot.img
 tools/busybox-src/
+tools/initramfs-root/bin/busybox
+tools/initramfs-root/init_busybox
+tools/ramdisk*.cpio.gz
