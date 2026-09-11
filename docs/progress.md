@@ -122,3 +122,15 @@ Net: the crash is still invisible without a hardware UART. The next useful step
 is (a) solder a UART to the serial test points, or (b) move the ramoops to the
 vendor `0xA9000000` region *and* rebuild a downstream kernel with matching
 `record-size` so Android/TWRP can read it back through its own pstore.
+
+## Pivot to the downstream kernel
+
+Since the user won't open the phone (no UART), the path forward is **option 3**:
+build the proven-bootable **downstream 5.4 QGKI kernel** (`lahaina-qgki_defconfig`,
+the vendor source at `microsoft/surface-duo-oss-kernel.msm-5..4`), boot it with a
+Linux initramfs, and get a working console + shell. That also yields a readable
+boot log that reveals what the Duo 2 boot actually requires — indirect evidence
+for the mainline bring-up. (Trade-off accepted: the downstream kernel has the
+vendor display/GPU stack, not the mainline DRM+mesa that Hyprland needs.) The
+manual build is `gki_defconfig` + merged `lahaina_GKI`/`lahaina_QGKI` fragments,
+with `KERNEL_DEFCONFIG=lahaina-qgki_defconfig` exported (see Gotchas §14).

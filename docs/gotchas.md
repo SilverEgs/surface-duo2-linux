@@ -110,3 +110,15 @@ on the Duo 2 it's `0xA9000000`, 2 MiB), and (b) the recovery kernel usually ship
 kernel must mount pstore itself via a DT node **matching your layout** (same
 address *and* same `record-size`/`console-size`/`pmsg-size`), or the records
 mis-parse.
+
+## 14. The downstream QGKI kernel needs `KERNEL_DEFCONFIG` set to build
+
+The Microsoft/Qualcomm msm-5.4 tree has a `scripts/setlocalversion` check
+("MSCHANGE" patch) that requires `KERNEL_DEFCONFIG` and intentionally emits a
+`>64`-char `"UNKNOWN KERNEL CONFIG … - ERROR ---…"` string — which breaks
+`utsrelease.h` — when it's unset. Building manually (not via `build.sh`) leaves
+it empty, so every build dies at `include/generated/utsrelease.h`. Fix:
+`export KERNEL_DEFCONFIG=lahaina-qgki_defconfig` before `make`. The manual build
+is `gki_defconfig` + `merge_config.sh -m …/lahaina_GKI.config
+…/lahaina_QGKI.config` + `olddefconfig` + `make Image` (the full `build.sh`
+blends those fragments via `generate_defconfig.sh`).
